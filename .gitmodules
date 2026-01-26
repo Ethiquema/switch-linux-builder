@@ -1,0 +1,3 @@
+[submodule "l4t-debs"]
+	path = l4t-debs
+	url = git@github.com:Ethiquema/l4t-debs.git

@@ -1,0 +1,21 @@
+# Cache files
+.cache/
+
+# Build outputs
+*.img
+*.7z
+*.rom
+output/
+
+# IDE
+.vscode/
+.idea/
+
+# Temp files
+*.tmp
+*.log
+*.swp
+*~
+
+# Claude
+.claude/

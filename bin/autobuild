@@ -1,0 +1,1230 @@
+#!/bin/bash
+#
+# Switch Linux Builder - Main build script
+# Creates bootable Linux images for Nintendo Switch via Hekate
+#
+
+set -e
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+IMAGES_DIR="$PROJECT_ROOT/images"
+OUTPUT_DIR="$PROJECT_ROOT/output"
+
+# Default values
+VERBOSE=false
+KEEP_TEMP=false
+NO_KVM=false
+STAGE=""
+BUILD_NAME=""  # Custom name for the build (default: derived from distro name)
+
+# Ubuntu cloud image (Noble 24.04 LTS)
+BASE_IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
+
+# QEMU settings
+QEMU_RAM="4G"
+QEMU_CPUS="4"
+
+# Part sizes (in MB)
+ROOTFS_PART_SIZE_MB=3900
+HOMEFS_PART_SIZE_MB=1900
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[OK]${NC} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+log_verbose() {
+    if $VERBOSE; then
+        echo -e "${BLUE}[DEBUG]${NC} $1"
+    fi
+}
+
+cleanup() {
+    local exit_code=$?
+    if ! $KEEP_TEMP && [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
+        log_info "Cleaning up temporary files... (exit code: $exit_code)"
+        # Unmount any mounted filesystems
+        for mount in $(mount | grep "$WORKDIR" | awk '{print $3}' | sort -r); do
+            sudo umount "$mount" 2>/dev/null || umount "$mount" 2>/dev/null || true
+        done
+        # Detach loop devices
+        for loop in $(losetup -a 2>/dev/null | grep "$WORKDIR" | cut -d: -f1); do
+            sudo losetup -d "$loop" 2>/dev/null || losetup -d "$loop" 2>/dev/null || true
+        done
+        # Remove workdir (may need sudo if files were created as root)
+        rm -rf "$WORKDIR" 2>/dev/null || sudo rm -rf "$WORKDIR" 2>/dev/null || true
+    fi
+    exit $exit_code
+}
+
+trap cleanup EXIT
+
+show_help() {
+    cat << EOF
+Switch Linux Builder - Creates bootable Linux images for Nintendo Switch
+
+Usage: $(basename "$0") [OPTIONS]
+
+Options:
+    -i, --image NAME        Image to build (e.g., switch/default+emulations)
+    -n, --name NAME         Custom name for the build (default: distro name)
+                            Used for: folder names, Hekate entry, boot args
+    -l, --list              List available images and services
+    -s, --stage STAGE       Run only specific stage (see stages below)
+    -o, --output DIR        Output directory (default: ./output)
+    -v, --verbose           Verbose output
+    -k, --keep-temp         Keep temporary files after build
+    --no-kvm                Disable KVM acceleration (slower)
+    -h, --help              Show this help message
+
+Build Stages:
+    download    - Download Debian ARM64 base image
+    qemu        - Run QEMU to install packages
+    rootfs      - Create SquashFS rootfs and split into parts
+    homefs      - Create initial ext4 homefs partition
+    initramfs   - Generate custom initramfs
+    bootfiles   - Extract kernel, DTB, download coreboot
+    package     - Package final output with Hekate config
+
+Examples:
+    $(basename "$0") --list
+    $(basename "$0") --image switch/default+emulations
+    $(basename "$0") --image switch/default+emulations+tabs+desktop+android+kodi
+    $(basename "$0") --image switch/default --stage qemu
+
+EOF
+}
+
+# =============================================================================
+# IMAGE AND SERVICE MANAGEMENT
+# =============================================================================
+
+list_images() {
+    echo "Available distributions:"
+    echo "  switch    Nintendo Switch (ARM64 Tegra X1)"
+    echo ""
+    echo "Available services:"
+    for service_dir in "$IMAGES_DIR"/switch/services/*/; do
+        if [ -d "$service_dir" ]; then
+            service_name=$(basename "$service_dir")
+            # Read description from setup.sh if available
+            desc=""
+            if [ -f "$service_dir/setup.sh" ]; then
+                desc=$(grep -m1 "^# Description:" "$service_dir/setup.sh" 2>/dev/null | sed 's/# Description: //' || true)
+            fi
+            printf "  %-12s %s\n" "$service_name" "$desc"
+        fi
+    done
+    echo ""
+    echo "Example build command:"
+    echo "  $(basename "$0") --image switch/default+emulations"
+}
+
+# Parse image name like "switch/default+emulations+tabs"
+parse_image_name() {
+    local image_name="$1"
+
+    # Extract distro (before /)
+    DISTRO=$(echo "$image_name" | cut -d'/' -f1)
+
+    # Extract services (after /, split by +)
+    local services_str=$(echo "$image_name" | cut -d'/' -f2)
+    REQUESTED_SERVICES=$(echo "$services_str" | tr '+' ' ')
+
+    log_verbose "Distro: $DISTRO"
+    log_verbose "Requested services: $REQUESTED_SERVICES"
+}
+
+# Resolve service dependencies
+resolve_dependencies() {
+    # Start with requested services
+    local all_services="$REQUESTED_SERVICES"
+
+    # Always include base
+    if [[ ! " $all_services " =~ " base " ]]; then
+        all_services="base $all_services"
+    fi
+
+    # Resolve dependencies iteratively
+    local changed=true
+    while $changed; do
+        changed=false
+        for service in $all_services; do
+            local depends_file="$IMAGES_DIR/$DISTRO/services/$service/depends.sh"
+            if [ -f "$depends_file" ]; then
+                # Reset and source
+                local DEPENDS_ON=""
+                source "$depends_file"
+                for dep in $DEPENDS_ON; do
+                    if [[ ! " $all_services " =~ " $dep " ]]; then
+                        all_services="$all_services $dep"
+                        changed=true
+                    fi
+                done
+            fi
+        done
+    done
+
+    # Order: base first, then others
+    local others=$(echo "$all_services" | tr ' ' '\n' | grep -v "^base$" | grep -v "^$" | sort -u | tr '\n' ' ')
+    SERVICES="base $others"
+    SERVICES=$(echo "$SERVICES" | xargs)  # Trim whitespace
+
+    log_info "Services to install (with dependencies): $SERVICES"
+}
+
+# =============================================================================
+# BUILD STAGES
+# =============================================================================
+
+check_dependencies() {
+    log_info "Checking build dependencies..."
+
+    local missing=""
+
+    # Required tools
+    local tools="qemu-system-aarch64 debootstrap mksquashfs losetup dmsetup parted mkfs.ext4 mkfs.vfat cpio gzip curl wget 7z"
+
+    for tool in $tools; do
+        if ! command -v "$tool" &> /dev/null; then
+            missing="$missing $tool"
+        fi
+    done
+
+    if [ -n "$missing" ]; then
+        log_error "Missing required tools:$missing"
+        log_error "Please install them before continuing."
+        exit 1
+    fi
+
+    # Check for root access (needed for losetup, mount)
+    if [ "$EUID" -ne 0 ]; then
+        log_warn "Not running as root. Some operations may require sudo."
+    fi
+
+    # Check KVM availability for ARM64
+    # KVM only works if host is also ARM64
+    KVM_ENABLED=false
+    if [ -e /dev/kvm ] && ! $NO_KVM; then
+        local host_arch=$(uname -m)
+        if [ "$host_arch" = "aarch64" ]; then
+            KVM_ENABLED=true
+            log_success "KVM acceleration available (native ARM64)"
+        else
+            log_warn "KVM exists but host is $host_arch - ARM64 emulation will be used (slower)"
+        fi
+    else
+        log_warn "KVM not available, using emulation (slower)"
+    fi
+
+    log_success "All dependencies satisfied"
+}
+
+# Stage 1: Download base image
+stage_download() {
+    log_info "=== STAGE 1: Download base image ==="
+
+    local cache_dir="$PROJECT_ROOT/.cache"
+    mkdir -p "$cache_dir"
+
+    BASE_IMAGE="$cache_dir/ubuntu-noble-arm64.img"
+
+    if [ -f "$BASE_IMAGE" ]; then
+        log_info "Using cached Ubuntu Noble image"
+    else
+        log_info "Downloading Ubuntu Noble ARM64 cloud image..."
+        curl -L -o "$BASE_IMAGE.tmp" "$BASE_IMAGE_URL"
+        mv "$BASE_IMAGE.tmp" "$BASE_IMAGE"
+        log_success "Download complete"
+    fi
+
+    # Copy to workdir for modification (convert qcow2 to raw if needed)
+    WORK_IMAGE="$WORKDIR/ubuntu-work.raw"
+    if file "$BASE_IMAGE" | grep -q "QCOW"; then
+        log_info "Converting qcow2 to raw..."
+        qemu-img convert -f qcow2 -O raw "$BASE_IMAGE" "$WORK_IMAGE"
+    else
+        cp "$BASE_IMAGE" "$WORK_IMAGE"
+    fi
+
+    log_success "Stage 1 complete"
+}
+
+# Stage 2: QEMU setup - install packages
+stage_qemu() {
+    log_info "=== STAGE 2: QEMU setup ==="
+
+    # Resize image for package installation
+    log_info "Resizing work image to 16G..."
+    qemu-img resize "$WORK_IMAGE" 16G
+
+    # Build combined setup script from all services
+    log_info "Building setup script from services: $SERVICES"
+
+    SETUP_SCRIPT="$WORKDIR/setup.sh"
+    cat > "$SETUP_SCRIPT" << 'HEADER'
+#!/bin/bash
+set -e
+export DEBIAN_FRONTEND=noninteractive
+
+echo "=== Switch Linux Setup Script ==="
+echo "Starting at $(date)"
+
+HEADER
+
+    # Append each service's setup.sh
+    for service in $SERVICES; do
+        local service_setup="$IMAGES_DIR/$DISTRO/services/$service/setup.sh"
+        if [ -f "$service_setup" ]; then
+            echo "" >> "$SETUP_SCRIPT"
+            echo "# =============================================" >> "$SETUP_SCRIPT"
+            echo "# Service: $service" >> "$SETUP_SCRIPT"
+            echo "# =============================================" >> "$SETUP_SCRIPT"
+            cat "$service_setup" >> "$SETUP_SCRIPT"
+        fi
+    done
+
+    cat >> "$SETUP_SCRIPT" << 'FOOTER'
+
+echo "=== Setup complete at $(date) ==="
+sync
+poweroff
+FOOTER
+
+    chmod +x "$SETUP_SCRIPT"
+
+    # Copy setupfiles from all services
+    SETUPFILES_DIR="$WORKDIR/setupfiles"
+    mkdir -p "$SETUPFILES_DIR"
+    for service in $SERVICES; do
+        local service_files="$IMAGES_DIR/$DISTRO/services/$service/setupfiles"
+        if [ -d "$service_files" ]; then
+            cp -r "$service_files"/* "$SETUPFILES_DIR/" 2>/dev/null || true
+        fi
+    done
+
+    # Merge first-boot scripts from all services into services-first-boot.sh
+    log_info "Merging first-boot scripts..."
+    SERVICES_FIRSTBOOT="$SETUPFILES_DIR/services-first-boot.sh"
+
+    for service in $SERVICES; do
+        local service_firstboot="$IMAGES_DIR/$DISTRO/services/$service/first-boot/init.sh"
+
+        if [ -f "$service_firstboot" ]; then
+            log_verbose "Adding first-boot script for: $service"
+
+            # Create temporary file with service content
+            local service_content=$(mktemp)
+            echo "" >> "$service_content"
+            echo "# ------ $service service ------" >> "$service_content"
+            cat "$service_firstboot" >> "$service_content"
+            echo "" >> "$service_content"
+
+            # Insert before END marker using awk
+            awk -v content="$service_content" '
+                /# ====== END SERVICES INITIALIZATION ======/ {
+                    while ((getline line < content) > 0) {
+                        print line
+                    }
+                    close(content)
+                }
+                { print }
+            ' "$SERVICES_FIRSTBOOT" > "${SERVICES_FIRSTBOOT}.tmp"
+
+            mv "${SERVICES_FIRSTBOOT}.tmp" "$SERVICES_FIRSTBOOT"
+            rm -f "$service_content"
+        fi
+    done
+
+    # Create setup ISO with proper structure
+    log_info "Creating setup ISO..."
+    SETUP_ISO="$WORKDIR/setup.iso"
+    SETUP_ISO_DIR="$WORKDIR/setup-iso-content"
+    mkdir -p "$SETUP_ISO_DIR/setupfiles"
+    cp "$SETUP_SCRIPT" "$SETUP_ISO_DIR/setup"
+    chmod +x "$SETUP_ISO_DIR/setup"
+    # Copy setupfiles if they exist
+    if [ -d "$SETUPFILES_DIR" ] && [ "$(ls -A "$SETUPFILES_DIR" 2>/dev/null)" ]; then
+        cp -r "$SETUPFILES_DIR"/* "$SETUP_ISO_DIR/setupfiles/"
+    fi
+    genisoimage -o "$SETUP_ISO" -V "SETUP" -r -J "$SETUP_ISO_DIR" 2>/dev/null
+
+    # Create cloud-init seed
+    log_info "Creating cloud-init configuration..."
+    SEED_DIR="$WORKDIR/seed"
+    mkdir -p "$SEED_DIR"
+
+    cat > "$SEED_DIR/meta-data" << EOF
+instance-id: switch-linux-build
+local-hostname: switch-linux
+EOF
+
+    cat > "$SEED_DIR/user-data" << 'EOF'
+#cloud-config
+users:
+  - name: build
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    shell: /bin/bash
+    lock_passwd: false
+
+chpasswd:
+  list: |
+    build:build
+    root:root
+  expire: false
+
+runcmd:
+  - echo "=== Cloud-init starting setup ==="
+  - mkdir -p /mnt/setup
+  - |
+    # Try different devices for setup ISO
+    for dev in /dev/vdc /dev/sr0 /dev/sr1 /dev/cdrom; do
+      if [ -b "$dev" ]; then
+        echo "Trying to mount $dev..."
+        if mount -o ro "$dev" /mnt/setup 2>/dev/null; then
+          echo "Mounted $dev successfully"
+          break
+        fi
+      fi
+    done
+  - ls -la /mnt/setup/ || echo "Setup mount failed!"
+  - mkdir -p /etc/setupfiles
+  - cp -r /mnt/setup/setupfiles/* /etc/setupfiles/ 2>/dev/null || true
+  - |
+    if [ -x /mnt/setup/setup ]; then
+      echo "Running setup script..."
+      /mnt/setup/setup 2>&1 | tee /var/log/switch-setup.log
+      echo "Setup script finished with exit code $?"
+    else
+      echo "ERROR: /mnt/setup/setup not found or not executable!"
+      ls -la /mnt/setup/
+    fi
+EOF
+
+    SEED_ISO="$WORKDIR/seed.img"
+    genisoimage -o "$SEED_ISO" -V "cidata" -r -J "$SEED_DIR" 2>/dev/null
+
+    # Find UEFI firmware
+    UEFI_FW=""
+    for fw_path in \
+        /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
+        /usr/share/edk2/aarch64/QEMU_EFI.fd \
+        /usr/share/AAVMF/AAVMF_CODE.fd \
+        /usr/share/qemu/edk2-aarch64-code.fd \
+        /usr/share/edk2-ovmf/aarch64/QEMU_EFI.fd; do
+        if [ -f "$fw_path" ]; then
+            UEFI_FW="$fw_path"
+            break
+        fi
+    done
+
+    if [ -z "$UEFI_FW" ]; then
+        log_error "UEFI firmware for ARM64 not found!"
+        log_error "Install one of: qemu-efi-aarch64, edk2-aarch64, AAVMF"
+        exit 1
+    fi
+
+    log_info "Using UEFI firmware: $UEFI_FW"
+
+    # Build QEMU command
+    QEMU_CMD="qemu-system-aarch64"
+    QEMU_CMD="$QEMU_CMD -machine virt"
+    QEMU_CMD="$QEMU_CMD -cpu cortex-a57"
+    QEMU_CMD="$QEMU_CMD -m $QEMU_RAM"
+    QEMU_CMD="$QEMU_CMD -smp $QEMU_CPUS"
+
+    if $KVM_ENABLED; then
+        QEMU_CMD="$QEMU_CMD -enable-kvm"
+    fi
+
+    QEMU_CMD="$QEMU_CMD -bios $UEFI_FW"
+    QEMU_CMD="$QEMU_CMD -drive file=$WORK_IMAGE,format=raw,if=virtio,cache=writeback"
+    QEMU_CMD="$QEMU_CMD -drive file=$SEED_ISO,format=raw,if=virtio"
+    # Setup ISO as CDROM so it appears as /dev/sr0
+    QEMU_CMD="$QEMU_CMD -cdrom $SETUP_ISO"
+    QEMU_CMD="$QEMU_CMD -netdev user,id=net0"
+    QEMU_CMD="$QEMU_CMD -device virtio-net-pci,netdev=net0"
+    QEMU_CMD="$QEMU_CMD -nographic"
+
+    log_info "Starting QEMU for package installation..."
+    log_info "This may take a while..."
+    log_verbose "Command: $QEMU_CMD"
+
+    # Run QEMU and capture output
+    set +e
+    if $VERBOSE; then
+        $QEMU_CMD
+        QEMU_EXIT=$?
+    else
+        # Show more output including cloud-init and apt progress
+        $QEMU_CMD 2>&1 | tee "$WORKDIR/qemu.log" | grep -E "(===|Cloud-init|cloud-init|Installing|Setting up|Unpacking|apt|ERROR|error|Error|Warning|warning|running|Starting|poweroff|setup)" || true
+        QEMU_EXIT=${PIPESTATUS[0]}
+    fi
+    set -e
+
+    # Check if image still exists and has content
+    if [ ! -f "$WORK_IMAGE" ]; then
+        log_error "QEMU image disappeared! Check $WORKDIR/qemu.log for errors"
+        exit 1
+    fi
+
+    local image_size=$(stat -c %s "$WORK_IMAGE" 2>/dev/null || echo "0")
+    if [ "$image_size" -lt 1000000000 ]; then
+        log_error "QEMU image seems corrupted (size: $image_size bytes)"
+        log_error "Check $WORKDIR/qemu.log for errors"
+        exit 1
+    fi
+
+    # Verify image after QEMU
+    log_info "Verifying image after QEMU..."
+    ls -la "$WORK_IMAGE" || log_error "Image file missing!"
+    log_info "Image size: $(du -h "$WORK_IMAGE" 2>/dev/null | cut -f1 || echo 'N/A')"
+
+    log_success "Stage 2 complete (QEMU exit code: $QEMU_EXIT)"
+}
+
+# Stage 3: Create rootfs squashfs
+stage_rootfs() {
+    log_info "=== STAGE 3: Create rootfs ==="
+
+    # Check if image exists
+    if [ ! -f "$WORK_IMAGE" ]; then
+        log_error "Work image not found: $WORK_IMAGE"
+        log_error "Did stage_qemu complete successfully?"
+        exit 1
+    fi
+
+    log_info "Work image size: $(du -h "$WORK_IMAGE" | cut -f1)"
+
+    ROOTFS_DIR="$WORKDIR/rootfs"
+    mkdir -p "$ROOTFS_DIR"
+
+    # Mount the work image (requires root)
+    log_info "Mounting work image..."
+    if [ "$EUID" -ne 0 ]; then
+        log_info "Using sudo for losetup..."
+        LOOP_DEV=$(sudo losetup -f --show -P "$WORK_IMAGE")
+        SUDO_PREFIX="sudo"
+    else
+        LOOP_DEV=$(losetup -f --show -P "$WORK_IMAGE")
+        SUDO_PREFIX=""
+    fi
+
+    # Find the root partition (usually partition 1 or 2)
+    ROOT_PART=""
+    for part in "${LOOP_DEV}p1" "${LOOP_DEV}p2" "${LOOP_DEV}p3"; do
+        if [ -b "$part" ]; then
+            fstype=$($SUDO_PREFIX blkid -o value -s TYPE "$part" 2>/dev/null || true)
+            if [ "$fstype" = "ext4" ]; then
+                ROOT_PART="$part"
+                break
+            fi
+        fi
+    done
+
+    if [ -z "$ROOT_PART" ]; then
+        log_error "Could not find root partition in image"
+        $SUDO_PREFIX losetup -d "$LOOP_DEV"
+        exit 1
+    fi
+
+    log_info "Found root partition: $ROOT_PART"
+
+    MOUNT_POINT="$WORKDIR/mnt"
+    mkdir -p "$MOUNT_POINT"
+    $SUDO_PREFIX mount "$ROOT_PART" "$MOUNT_POINT"
+
+    # Copy rootfs excluding /home (will be on homefs)
+    log_info "Copying rootfs (excluding /home)..."
+    $SUDO_PREFIX rsync -aAX --exclude='/home/*' --exclude='/tmp/*' --exclude='/var/tmp/*' \
+        --exclude='/var/cache/apt/archives/*.deb' \
+        "$MOUNT_POINT/" "$ROOTFS_DIR/"
+
+    # Save /home contents for homefs
+    HOMEFS_CONTENT="$WORKDIR/home-content"
+    mkdir -p "$HOMEFS_CONTENT"
+    if [ -d "$MOUNT_POINT/home" ]; then
+        $SUDO_PREFIX cp -a "$MOUNT_POINT/home/"* "$HOMEFS_CONTENT/" 2>/dev/null || true
+    fi
+
+    # Cleanup mount
+    $SUDO_PREFIX umount "$MOUNT_POINT"
+    $SUDO_PREFIX losetup -d "$LOOP_DEV"
+
+    # Clean up rootfs
+    log_info "Cleaning rootfs..."
+    $SUDO_PREFIX rm -rf "$ROOTFS_DIR"/var/cache/apt/archives/*.deb
+    $SUDO_PREFIX rm -rf "$ROOTFS_DIR"/var/lib/apt/lists/*
+    $SUDO_PREFIX rm -rf "$ROOTFS_DIR"/tmp/*
+    $SUDO_PREFIX rm -rf "$ROOTFS_DIR"/var/tmp/*
+
+    # Create empty /home mountpoint
+    $SUDO_PREFIX mkdir -p "$ROOTFS_DIR/home"
+
+    # Create /sd mountpoint for SD card access
+    $SUDO_PREFIX mkdir -p "$ROOTFS_DIR/sd"
+
+    # Create squashfs
+    log_info "Creating squashfs..."
+    SQUASHFS_FILE="$WORKDIR/rootfs.squashfs"
+    $SUDO_PREFIX mksquashfs "$ROOTFS_DIR" "$SQUASHFS_FILE" -comp zstd -Xcompression-level 19 -progress
+    # Fix ownership so we can work with it without sudo
+    $SUDO_PREFIX chown $(id -u):$(id -g) "$SQUASHFS_FILE"
+
+    # Split into parts if needed
+    log_info "Splitting squashfs into parts..."
+    "$SCRIPT_DIR/split-image.sh" "$SQUASHFS_FILE" "$WORKDIR/rootfs-parts" "$ROOTFS_PART_SIZE_MB"
+
+    log_success "Stage 3 complete"
+}
+
+# Stage 4: Create initial homefs
+stage_homefs() {
+    log_info "=== STAGE 4: Create homefs ==="
+
+    HOMEFS_FILE="$WORKDIR/homefs.ext4.part000"
+    HOMEFS_SIZE_MB=$HOMEFS_PART_SIZE_MB
+
+    # Determine sudo prefix
+    if [ "$EUID" -ne 0 ]; then
+        SUDO_PREFIX="sudo"
+    else
+        SUDO_PREFIX=""
+    fi
+
+    # Create sparse file
+    log_info "Creating homefs partition (${HOMEFS_SIZE_MB}MB)..."
+    dd if=/dev/zero of="$HOMEFS_FILE" bs=1M count=0 seek=$HOMEFS_SIZE_MB 2>/dev/null
+
+    # Format as ext4
+    $SUDO_PREFIX mkfs.ext4 -q -L SWLINUX_HOME "$HOMEFS_FILE"
+
+    # Mount and populate
+    HOMEFS_MOUNT="$WORKDIR/homefs-mount"
+    mkdir -p "$HOMEFS_MOUNT"
+
+    LOOP_HOMEFS=$($SUDO_PREFIX losetup -f --show "$HOMEFS_FILE")
+    $SUDO_PREFIX mount "$LOOP_HOMEFS" "$HOMEFS_MOUNT"
+
+    # Copy home content from QEMU build
+    if [ -d "$HOMEFS_CONTENT" ] && [ "$(ls -A "$HOMEFS_CONTENT" 2>/dev/null)" ]; then
+        log_info "Copying home content..."
+        $SUDO_PREFIX cp -a "$HOMEFS_CONTENT/"* "$HOMEFS_MOUNT/" 2>/dev/null || true
+    fi
+
+    # Create overlay directories
+    log_info "Creating overlay directories..."
+    $SUDO_PREFIX mkdir -p "$HOMEFS_MOUNT/.overlays/etc/upper" "$HOMEFS_MOUNT/.overlays/etc/work"
+    $SUDO_PREFIX mkdir -p "$HOMEFS_MOUNT/.overlays/var/upper" "$HOMEFS_MOUNT/.overlays/var/work"
+
+    # Ensure switch user home exists
+    $SUDO_PREFIX mkdir -p "$HOMEFS_MOUNT/switch"
+    $SUDO_PREFIX chown 1000:1000 "$HOMEFS_MOUNT/switch"
+
+    # Cleanup
+    $SUDO_PREFIX umount "$HOMEFS_MOUNT"
+    $SUDO_PREFIX losetup -d "$LOOP_HOMEFS"
+
+    log_success "Stage 4 complete"
+}
+
+# Stage 5: Create initramfs
+stage_initramfs() {
+    log_info "=== STAGE 5: Create initramfs ==="
+
+    "$SCRIPT_DIR/create-initramfs.sh" "$WORKDIR/initramfs.img" "$WORK_IMAGE"
+
+    log_success "Stage 5 complete"
+}
+
+# Stage 6: Extract kernel and boot files
+stage_bootfiles() {
+    log_info "=== STAGE 6: Extract boot files ==="
+
+    BOOTFILES_DIR="$WORKDIR/bootfiles"
+    mkdir -p "$BOOTFILES_DIR"
+
+    # Determine sudo prefix
+    if [ "$EUID" -ne 0 ]; then
+        SUDO_PREFIX="sudo"
+    else
+        SUDO_PREFIX=""
+    fi
+
+    # Check if image exists
+    if [ ! -f "$WORK_IMAGE" ]; then
+        log_error "Work image not found: $WORK_IMAGE"
+        exit 1
+    fi
+
+    # Extract kernel and DTB from QEMU image
+    log_info "Extracting kernel and device tree from image..."
+
+    LOOP_DEV=$($SUDO_PREFIX losetup -f --show -P "$WORK_IMAGE")
+
+    # Find root partition
+    ROOT_PART=""
+    for part in "${LOOP_DEV}p1" "${LOOP_DEV}p2" "${LOOP_DEV}p3"; do
+        if [ -b "$part" ]; then
+            fstype=$($SUDO_PREFIX blkid -o value -s TYPE "$part" 2>/dev/null || true)
+            if [ "$fstype" = "ext4" ]; then
+                ROOT_PART="$part"
+                break
+            fi
+        fi
+    done
+
+    MOUNT_POINT="$WORKDIR/boot-mount"
+    mkdir -p "$MOUNT_POINT"
+    $SUDO_PREFIX mount "$ROOT_PART" "$MOUNT_POINT"
+
+    # Copy kernel Image (prefer L4T kernel from theofficialgman debs)
+    NEED_SWITCHROOT_KERNEL=false
+    if $SUDO_PREFIX ls "$MOUNT_POINT/boot/vmlinuz-"*l4t* 2>/dev/null | head -1; then
+        local vmlinuz=$($SUDO_PREFIX ls "$MOUNT_POINT/boot/vmlinuz-"*l4t* 2>/dev/null | head -1)
+        $SUDO_PREFIX cp "$vmlinuz" "$BOOTFILES_DIR/Image"
+        log_success "Found L4T kernel: $vmlinuz"
+    elif [ -f "$MOUNT_POINT/boot/Image" ]; then
+        $SUDO_PREFIX cp "$MOUNT_POINT/boot/Image" "$BOOTFILES_DIR/"
+        log_success "Found kernel: Image"
+    elif $SUDO_PREFIX ls "$MOUNT_POINT/boot/vmlinuz-"* 2>/dev/null | head -1; then
+        local vmlinuz=$($SUDO_PREFIX ls "$MOUNT_POINT/boot/vmlinuz-"* 2>/dev/null | head -1)
+        $SUDO_PREFIX cp "$vmlinuz" "$BOOTFILES_DIR/Image"
+        log_warn "Using generic kernel: $vmlinuz (may not work on Switch)"
+        NEED_SWITCHROOT_KERNEL=true
+    else
+        log_error "No kernel found in image!"
+        NEED_SWITCHROOT_KERNEL=true
+    fi
+
+    # Copy device tree (prefer nx-plat.dtimg from L4T debs)
+    NEED_SWITCHROOT_DTB=false
+    if $SUDO_PREFIX ls "$MOUNT_POINT/boot/"*nx-plat*.dtimg 2>/dev/null | head -1; then
+        local dtimg=$($SUDO_PREFIX ls "$MOUNT_POINT/boot/"*nx-plat*.dtimg 2>/dev/null | head -1)
+        $SUDO_PREFIX cp "$dtimg" "$BOOTFILES_DIR/nx-plat.dtimg"
+        log_success "Found L4T DTB image: $dtimg"
+    elif [ -d "$MOUNT_POINT/boot/dtb-l4t" ]; then
+        # L4T debs may install to dtb-l4t directory
+        if $SUDO_PREFIX ls "$MOUNT_POINT/boot/dtb-l4t/"*nx-plat*.dtimg 2>/dev/null | head -1; then
+            local dtimg=$($SUDO_PREFIX ls "$MOUNT_POINT/boot/dtb-l4t/"*nx-plat*.dtimg 2>/dev/null | head -1)
+            $SUDO_PREFIX cp "$dtimg" "$BOOTFILES_DIR/nx-plat.dtimg"
+            log_success "Found L4T DTB image: $dtimg"
+        fi
+    elif [ -f "$MOUNT_POINT/boot/dtb/tegra210-icosa.dtb" ]; then
+        $SUDO_PREFIX cp "$MOUNT_POINT/boot/dtb/tegra210-icosa.dtb" "$BOOTFILES_DIR/"
+        log_success "Found DTB: tegra210-icosa.dtb"
+    elif [ -d "$MOUNT_POINT/boot/dtb" ]; then
+        local dtb=$($SUDO_PREFIX find "$MOUNT_POINT/boot/dtb" -name "*icosa*.dtb" 2>/dev/null | head -1)
+        if [ -n "$dtb" ]; then
+            $SUDO_PREFIX cp "$dtb" "$BOOTFILES_DIR/tegra210-icosa.dtb"
+            log_success "Found DTB: $dtb"
+        else
+            NEED_SWITCHROOT_DTB=true
+        fi
+    else
+        log_warn "No device tree found in image"
+        NEED_SWITCHROOT_DTB=true
+    fi
+
+    # Cleanup mount
+    $SUDO_PREFIX umount "$MOUNT_POINT"
+    $SUDO_PREFIX losetup -d "$LOOP_DEV"
+
+    # Fix ownership of files copied with sudo
+    $SUDO_PREFIX chown -R $(id -u):$(id -g) "$BOOTFILES_DIR"
+
+    # Download Switchroot Ubuntu boot files as fallback if L4T debs didn't provide them
+    if [ "$NEED_SWITCHROOT_KERNEL" = "true" ] || [ "$NEED_SWITCHROOT_DTB" = "true" ]; then
+        log_info "Downloading Switch boot files from Switchroot Ubuntu Noble..."
+        local cache_dir="$PROJECT_ROOT/.cache"
+        mkdir -p "$cache_dir"
+
+        # Switchroot Ubuntu Noble contains L4T kernel compatible with Debian/Ubuntu userspace
+        SWITCHROOT_7Z="$cache_dir/switchroot-ubuntu-noble.7z"
+        SWITCHROOT_URL="https://download.switchroot.org/ubuntu-noble/theofficialgman-ubuntu-unity-noble-5.1.2-2025-08-16.7z"
+
+        # Check if cached file exists and is valid (>500MB)
+        if [ -f "$SWITCHROOT_7Z" ]; then
+            local file_size=$(stat -c %s "$SWITCHROOT_7Z" 2>/dev/null || echo 0)
+            if [ "$file_size" -lt 500000000 ]; then
+                log_warn "Cached Switchroot archive is corrupted (${file_size} bytes), re-downloading..."
+                rm -f "$SWITCHROOT_7Z"
+            fi
+        fi
+
+        if [ ! -f "$SWITCHROOT_7Z" ]; then
+            log_info "Downloading Switchroot Ubuntu Noble (~2GB, this may take a while)..."
+            curl -L --progress-bar -o "$SWITCHROOT_7Z" "$SWITCHROOT_URL" || {
+                log_error "Failed to download Switchroot archive"
+                rm -f "$SWITCHROOT_7Z"
+                SWITCHROOT_7Z=""
+            }
+        fi
+
+        if [ -f "$SWITCHROOT_7Z" ]; then
+            local switchroot_extract="$WORKDIR/switchroot-extract"
+            mkdir -p "$switchroot_extract"
+
+            log_info "Extracting Switchroot boot files (requires p7zip)..."
+            if command -v 7z &> /dev/null; then
+                # Extract boot-related files from the 7z archive
+                # Structure: switchroot/ubuntu-noble/uImage, nx-plat.dtimg, initramfs, boot.scr
+                7z x -o"$switchroot_extract" "$SWITCHROOT_7Z" "switchroot/ubuntu-noble/*" -y >/dev/null 2>&1 || true
+
+                local ubuntu_noble_dir="$switchroot_extract/switchroot/ubuntu-noble"
+
+                # Copy kernel (uImage format for U-Boot)
+                if [ "$NEED_SWITCHROOT_KERNEL" = "true" ]; then
+                    if [ -f "$ubuntu_noble_dir/uImage" ]; then
+                        cp "$ubuntu_noble_dir/uImage" "$BOOTFILES_DIR/Image"
+                        log_success "Copied Switchroot L4T kernel (uImage)"
+                    fi
+                fi
+
+                # Copy DTB (nx-plat.dtimg contains device trees)
+                if [ "$NEED_SWITCHROOT_DTB" = "true" ]; then
+                    if [ -f "$ubuntu_noble_dir/nx-plat.dtimg" ]; then
+                        cp "$ubuntu_noble_dir/nx-plat.dtimg" "$BOOTFILES_DIR/nx-plat.dtimg"
+                        log_success "Copied nx-plat.dtimg (device tree image)"
+                    fi
+                fi
+
+                # Also copy boot.scr from Switchroot (optimized for their setup)
+                if [ -f "$ubuntu_noble_dir/boot.scr" ]; then
+                    cp "$ubuntu_noble_dir/boot.scr" "$BOOTFILES_DIR/boot-switchroot.scr"
+                    log_info "Copied Switchroot boot.scr as reference"
+                fi
+
+                # Copy bl31/bl33 bootloader files
+                if [ -f "$ubuntu_noble_dir/bl31.bin" ]; then
+                    cp "$ubuntu_noble_dir/bl31.bin" "$BOOTFILES_DIR/"
+                fi
+                if [ -f "$ubuntu_noble_dir/bl33.bin" ]; then
+                    cp "$ubuntu_noble_dir/bl33.bin" "$BOOTFILES_DIR/"
+                fi
+
+                rm -rf "$switchroot_extract"
+            else
+                log_error "p7zip not installed! Install with: sudo pacman -S p7zip"
+                log_info "Alternatively, manually extract boot files from Switchroot Ubuntu"
+            fi
+        fi
+    fi
+
+    # Download coreboot.rom
+    log_info "Downloading coreboot.rom..."
+    local cache_dir="$PROJECT_ROOT/.cache"
+    mkdir -p "$cache_dir"
+
+    if [ ! -f "$cache_dir/coreboot.rom" ]; then
+        curl -L -o "$cache_dir/coreboot.rom" \
+            "https://github.com/lakka-switch/boot-scripts/raw/master/payloads/coreboot.rom" || \
+            log_warn "Failed to download coreboot.rom"
+    fi
+
+    if [ -f "$cache_dir/coreboot.rom" ]; then
+        cp "$cache_dir/coreboot.rom" "$BOOTFILES_DIR/"
+        log_success "coreboot.rom ready"
+    fi
+
+    # Create boot.scr (U-Boot script)
+    # Based on Switchroot's boot.scr but simplified for our initramfs-based boot
+    log_info "Creating boot.scr..."
+
+    cat > "$BOOTFILES_DIR/boot.txt" << 'BOOTSCR'
+# U-Boot boot script for Switch Linux
+# Based on Switchroot boot chain, adapted for initramfs root
+
+echo "=========================================="
+echo "       Switch Linux Boot Loader"
+echo "=========================================="
+
+# Set defaults (compatible with Switchroot/Hekate)
+test -n ${boot_dir} || setenv boot_dir /switchroot/switch-linux
+test -n ${devnum} || setenv devnum 1
+test -n ${distro_bootpart} || setenv distro_bootpart 1
+
+# Memory addresses (from Switchroot)
+setenv kernload 0xA0000000
+setenv fdtrload 0xA8000000
+setenv fdtraddr 0xA8100000
+setenv initaddr 0xB0000000
+
+# Detect Switch model SKU (0=Erista, 1=Mariko, 2=Lite)
+test -n ${sku} || setenv sku 0
+
+# Load kernel (uImage format)
+echo "Loading kernel..."
+if load mmc ${devnum}:${distro_bootpart} ${kernload} ${boot_dir}/Image; then
+    echo "Kernel loaded"
+else
+    echo "ERROR: Failed to load kernel!"
+    sleep 5
+    reset
+fi
+
+# Load initramfs
+echo "Loading initramfs..."
+if load mmc ${devnum}:${distro_bootpart} ${initaddr} ${boot_dir}/initramfs.img; then
+    echo "Initramfs loaded"
+else
+    echo "ERROR: Failed to load initramfs!"
+    sleep 5
+    reset
+fi
+
+# Load device tree image
+echo "Loading device tree..."
+if load mmc ${devnum}:${distro_bootpart} ${fdtrload} ${boot_dir}/nx-plat.dtimg; then
+    echo "Device tree image loaded"
+    # Extract correct DTB for this SKU
+    if dtimg load ${fdtrload} ${sku} ${fdtraddr} fdtrsize; then
+        echo "Device tree for SKU ${sku} extracted"
+    else
+        echo "WARNING: Could not extract DTB for SKU, using default"
+        setenv fdtraddr ${fdtrload}
+    fi
+else
+    # Fallback to single DTB file
+    if load mmc ${devnum}:${distro_bootpart} ${fdtraddr} ${boot_dir}/tegra210-icosa.dtb; then
+        echo "Fallback DTB loaded"
+    else
+        echo "ERROR: No device tree found!"
+        sleep 5
+        reset
+    fi
+fi
+
+# Set boot arguments
+# Our initramfs handles squashfs+ext4 assembly, overlays, etc.
+setenv bootargs "root=/dev/ram0 rw rootwait fbcon=rotate:3 consoleblank=0 quiet"
+setenv bootargs "${bootargs} swlinux.image=switch-linux ${bootargs_extra}"
+
+echo "Boot arguments: ${bootargs}"
+
+# Boot the kernel
+echo "Booting Switch Linux..."
+bootm ${kernload} ${initaddr}:${filesize} ${fdtraddr}
+BOOTSCR
+
+    # Compile boot.scr if mkimage is available
+    if command -v mkimage &> /dev/null; then
+        mkimage -A arm64 -T script -C none -n "Switch Linux" \
+            -d "$BOOTFILES_DIR/boot.txt" "$BOOTFILES_DIR/boot.scr"
+        rm "$BOOTFILES_DIR/boot.txt"
+        log_success "boot.scr compiled"
+    else
+        mv "$BOOTFILES_DIR/boot.txt" "$BOOTFILES_DIR/boot.scr.txt"
+        log_warn "mkimage not found - boot.scr not compiled (install u-boot-tools)"
+    fi
+
+    log_success "Stage 6 complete"
+}
+
+# Stage 7: Package final output
+stage_package() {
+    log_info "=== STAGE 7: Package final output ==="
+
+    # Create output directory with timestamp
+    local timestamp=$(date +%Y%m%d-%H%M%S)
+    local services_suffix=$(echo "$SERVICES" | tr ' ' '-')
+    FINAL_OUTPUT="$OUTPUT_DIR/${BUILD_NAME}-${services_suffix}-${timestamp}"
+    mkdir -p "$FINAL_OUTPUT"
+
+    # Create directory structure (matches Switchroot Ubuntu layout)
+    mkdir -p "$FINAL_OUTPUT/bootloader/ini"
+    mkdir -p "$FINAL_OUTPUT/switchroot/${BUILD_NAME}"
+    mkdir -p "$FINAL_OUTPUT/linux_img/${BUILD_NAME}/rootfs"
+    mkdir -p "$FINAL_OUTPUT/linux_img/${BUILD_NAME}/homefs"
+
+    # ==========================================================================
+    # Copy boot files
+    # ==========================================================================
+
+    log_info "Copying boot files..."
+
+    # Kernel
+    if [ -f "$BOOTFILES_DIR/Image" ]; then
+        cp "$BOOTFILES_DIR/Image" "$FINAL_OUTPUT/switchroot/${BUILD_NAME}/"
+        log_success "Copied kernel Image"
+    else
+        log_error "Kernel Image not found!"
+    fi
+
+    # Device tree (Switchroot uses nx-plat.dtimg)
+    if [ -f "$BOOTFILES_DIR/nx-plat.dtimg" ]; then
+        cp "$BOOTFILES_DIR/nx-plat.dtimg" "$FINAL_OUTPUT/switchroot/${BUILD_NAME}/"
+        log_success "Copied nx-plat.dtimg"
+    elif [ -f "$BOOTFILES_DIR/tegra210-icosa.dtb" ]; then
+        cp "$BOOTFILES_DIR/tegra210-icosa.dtb" "$FINAL_OUTPUT/switchroot/${BUILD_NAME}/"
+        log_success "Copied tegra210-icosa.dtb"
+    else
+        log_warn "Device tree not found - must be added manually"
+    fi
+
+    # Bootloader files (bl31, bl33)
+    if [ -f "$BOOTFILES_DIR/bl31.bin" ]; then
+        cp "$BOOTFILES_DIR/bl31.bin" "$FINAL_OUTPUT/switchroot/${BUILD_NAME}/"
+    fi
+    if [ -f "$BOOTFILES_DIR/bl33.bin" ]; then
+        cp "$BOOTFILES_DIR/bl33.bin" "$FINAL_OUTPUT/switchroot/${BUILD_NAME}/"
+    fi
+
+    # Initramfs
+    if [ -f "$WORKDIR/initramfs.img" ]; then
+        cp "$WORKDIR/initramfs.img" "$FINAL_OUTPUT/switchroot/${BUILD_NAME}/"
+        log_success "Copied initramfs.img"
+    else
+        log_error "Initramfs not found!"
+    fi
+
+    # Coreboot
+    if [ -f "$BOOTFILES_DIR/coreboot.rom" ]; then
+        cp "$BOOTFILES_DIR/coreboot.rom" "$FINAL_OUTPUT/switchroot/${BUILD_NAME}/"
+        log_success "Copied coreboot.rom"
+    else
+        log_warn "coreboot.rom not found"
+    fi
+
+    # Boot script
+    if [ -f "$BOOTFILES_DIR/boot.scr" ]; then
+        cp "$BOOTFILES_DIR/boot.scr" "$FINAL_OUTPUT/switchroot/${BUILD_NAME}/"
+        log_success "Copied boot.scr"
+    fi
+
+    # ==========================================================================
+    # Copy filesystem images
+    # ==========================================================================
+
+    log_info "Copying rootfs parts..."
+    cp "$WORKDIR/rootfs-parts"/* "$FINAL_OUTPUT/linux_img/${BUILD_NAME}/rootfs/"
+
+    log_info "Copying homefs..."
+    cp "$WORKDIR/homefs.ext4.part000" "$FINAL_OUTPUT/linux_img/${BUILD_NAME}/homefs/"
+
+    # ==========================================================================
+    # Create Hekate configuration
+    # ==========================================================================
+
+    log_info "Creating hekate configuration..."
+
+    # Generate ID from build name (uppercase, max 8 chars)
+    local hekate_id=$(echo "${BUILD_NAME}" | tr '[:lower:]-' '[:upper:]_' | cut -c1-8)
+
+    # Hekate boot entry (uses L4T loader like Switchroot Ubuntu)
+    cat > "$FINAL_OUTPUT/bootloader/ini/${BUILD_NAME}.ini" << EOF
+[${BUILD_NAME}]
+l4t=1
+boot_prefixes=/switchroot/${BUILD_NAME}/
+id=${hekate_id}
+
+; Boot arguments passed to kernel
+bootargs_extra=quiet swlinux.image=${BUILD_NAME}
+EOF
+
+    # ==========================================================================
+    # Create documentation
+    # ==========================================================================
+
+    cat > "$FINAL_OUTPUT/README.txt" << EOF
+${BUILD_NAME} - Built: $(date)
+Services: $SERVICES
+
+INSTALLATION:
+1. Copy all folders (bootloader, switchroot, linux_img) to SD card root
+2. Boot into Hekate -> More Configs -> ${BUILD_NAME}
+
+USAGE:
+- EmulationStation is the default interface
+- SELECT in ES to switch to: Phosh / XFCE / Waydroid / Kodi
+- SD card accessible at /sd
+- Home partition auto-expands when needed
+
+Login: switch / switch (passwordless sudo)
+EOF
+
+    # ==========================================================================
+    # Final summary
+    # ==========================================================================
+
+    log_success "Build complete!"
+    echo ""
+    echo "=========================================="
+    echo "           BUILD SUMMARY"
+    echo "=========================================="
+    echo ""
+    echo "Build name: $BUILD_NAME"
+    echo "Output directory: $FINAL_OUTPUT"
+    echo ""
+    echo "File structure:"
+    find "$FINAL_OUTPUT" -type f | sed "s|$FINAL_OUTPUT|.|" | sort
+    echo ""
+    echo "Size summary:"
+    du -sh "$FINAL_OUTPUT/switchroot/${BUILD_NAME}" | awk '{print "  Boot files:    " $1}'
+    ls -lh "$FINAL_OUTPUT/linux_img/${BUILD_NAME}/rootfs"/*.part* 2>/dev/null | awk '{sum+=$5} END {printf "  Rootfs:        %.1fG\n", sum/1024/1024/1024}'
+    ls -lh "$FINAL_OUTPUT/linux_img/${BUILD_NAME}/homefs"/*.part* 2>/dev/null | awk 'NR==1 {print "  Homefs:        " $5 " (sparse)"}'
+    echo ""
+    echo "Ready to copy to SD card!"
+    echo "=========================================="
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+main() {
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -i|--image)
+                IMAGE_NAME="$2"
+                shift 2
+                ;;
+            -n|--name)
+                BUILD_NAME="$2"
+                shift 2
+                ;;
+            -l|--list)
+                list_images
+                exit 0
+                ;;
+            -s|--stage)
+                STAGE="$2"
+                shift 2
+                ;;
+            -o|--output)
+                OUTPUT_DIR="$2"
+                shift 2
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -k|--keep-temp)
+                KEEP_TEMP=true
+                shift
+                ;;
+            --no-kvm)
+                NO_KVM=true
+                shift
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+
+    # Require image name
+    if [ -z "$IMAGE_NAME" ]; then
+        log_error "No image specified. Use --image or --list"
+        show_help
+        exit 1
+    fi
+
+    # Parse image name
+    parse_image_name "$IMAGE_NAME"
+
+    # Check distro exists
+    if [ ! -d "$IMAGES_DIR/$DISTRO" ]; then
+        log_error "Unknown distribution: $DISTRO"
+        exit 1
+    fi
+
+    # Load distro config
+    if [ -f "$IMAGES_DIR/$DISTRO/config.sh" ]; then
+        source "$IMAGES_DIR/$DISTRO/config.sh"
+    fi
+
+    # Set BUILD_NAME (default to distro name if not specified)
+    if [ -z "$BUILD_NAME" ]; then
+        BUILD_NAME="$DISTRO"
+    fi
+    log_info "Build name: $BUILD_NAME"
+
+    # Resolve dependencies
+    resolve_dependencies
+
+    # Check dependencies
+    check_dependencies
+
+    # Create work directory
+    WORKDIR=$(mktemp -d -t switch-linux-build.XXXXXX)
+    log_info "Work directory: $WORKDIR"
+
+    # Run stages
+    if [ -z "$STAGE" ]; then
+        # Run all stages
+        stage_download
+        stage_qemu
+        stage_rootfs
+        stage_homefs
+        stage_initramfs
+        stage_bootfiles
+        stage_package
+    else
+        # Run specific stage
+        case $STAGE in
+            download)
+                stage_download
+                ;;
+            qemu)
+                stage_download
+                stage_qemu
+                ;;
+            rootfs)
+                stage_rootfs
+                ;;
+            homefs)
+                stage_homefs
+                ;;
+            initramfs)
+                stage_initramfs
+                ;;
+            bootfiles)
+                stage_bootfiles
+                ;;
+            package)
+                stage_package
+                ;;
+            *)
+                log_error "Unknown stage: $STAGE"
+                exit 1
+                ;;
+        esac
+    fi
+}
+
+main "$@"
