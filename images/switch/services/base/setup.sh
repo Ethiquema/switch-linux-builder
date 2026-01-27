@@ -53,8 +53,19 @@ apt install $APT_OPTS \
     switch-bsp
 
 # NVIDIA L4T packages: preinst scripts check /proc/device-tree/compatible
-# which doesn't exist in QEMU, so we force install and skip those checks
-apt install $APT_OPTS -o Dpkg::Options::="--force-all" \
+# which doesn't exist in QEMU, fake it for installation
+if [[ ! -f /proc/device-tree/compatible ]]; then
+    mkdir -p /tmp/fake-dt
+    echo -n "nvidia,tegra210" > /tmp/fake-dt/compatible
+    mount --bind /tmp/fake-dt /proc/device-tree 2>/dev/null || {
+        # If bind mount fails, divert the preinst scripts instead
+        mkdir -p /proc/device-tree
+        echo -n "nvidia,tegra210" > /proc/device-tree/compatible
+    }
+    FAKE_DT=1
+fi
+
+apt install $APT_OPTS \
     nvidia-l4t-core \
     nvidia-l4t-firmware \
     nvidia-l4t-3d-core \
@@ -62,6 +73,12 @@ apt install $APT_OPTS -o Dpkg::Options::="--force-all" \
     nvidia-l4t-wayland \
     nvidia-l4t-multimedia \
     nvidia-l4t-configs
+
+# Cleanup fake device-tree
+if [[ "${FAKE_DT:-}" == "1" ]]; then
+    umount /proc/device-tree 2>/dev/null || true
+    rm -rf /tmp/fake-dt
+fi
 
 # Stop zram during build (no module in QEMU)
 systemctl stop zramswap 2>/dev/null || true
