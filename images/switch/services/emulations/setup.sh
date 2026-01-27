@@ -15,49 +15,13 @@ apt install $APT_OPTS \
     retroarch \
     retroarch-assets \
     libretro-core-info \
-    libretro-beetle-pce-fast \
-    libretro-beetle-psx \
-    libretro-beetle-saturn \
-    libretro-beetle-supergrafx \
-    libretro-beetle-vb \
-    libretro-beetle-wswan \
-    libretro-bsnes-mercury-balanced \
-    libretro-bsnes-mercury-performance \
-    libretro-desmume \
-    libretro-fceumm \
-    libretro-flycast \
-    libretro-gambatte \
-    libretro-genesis-plus-gx \
-    libretro-gpsp \
-    libretro-handy \
-    libretro-mame \
-    libretro-mednafen-gba \
-    libretro-mednafen-ngp \
-    libretro-mednafen-pce \
-    libretro-mednafen-snes \
-    libretro-mednafen-wswan \
-    libretro-mgba \
-    libretro-mupen64plus-next \
-    libretro-nestopia \
-    libretro-parallel-n64 \
-    libretro-pcsx-rearmed \
-    libretro-picodrive \
-    libretro-prosystem \
-    libretro-quicknes \
-    libretro-sameboy \
-    libretro-scummvm \
-    libretro-snes9x \
-    libretro-stella \
-    libretro-tgbdual \
-    libretro-vba-next \
-    libretro-yabause \
+    libretro-cores-l4t \
     dolphin-emu-l4t \
     azahar-emu-l4t \
     duckstation-l4t \
     ppsspp-l4t \
     melonds-l4t \
-    xemu-l4t \
-    libretro-cores-l4t
+    xemu-l4t
 
 # =============================================================================
 # RETROARCH CONFIGURATION
