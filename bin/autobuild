@@ -705,12 +705,18 @@ stage_bootfiles() {
     mkdir -p "$MOUNT_POINT"
     $SUDO_PREFIX mount "$ROOT_PART" "$MOUNT_POINT"
 
-    # Copy kernel Image (prefer L4T kernel from theofficialgman debs)
+    # Copy kernel Image (prefer switch-bsp bootstack, then L4T kernel)
     NEED_SWITCHROOT_KERNEL=false
-    if $SUDO_PREFIX ls "$MOUNT_POINT/boot/vmlinuz-"*l4t* 2>/dev/null | head -1; then
+    if [ -f "$MOUNT_POINT/opt/switchroot/bootstack/uImage" ]; then
+        $SUDO_PREFIX cp "$MOUNT_POINT/opt/switchroot/bootstack/uImage" "$BOOTFILES_DIR/Image"
+        log_success "Found switch-bsp kernel: uImage"
+    elif $SUDO_PREFIX ls "$MOUNT_POINT/boot/vmlinuz-"*l4t* 2>/dev/null | head -1; then
         local vmlinuz=$($SUDO_PREFIX ls "$MOUNT_POINT/boot/vmlinuz-"*l4t* 2>/dev/null | head -1)
         $SUDO_PREFIX cp "$vmlinuz" "$BOOTFILES_DIR/Image"
         log_success "Found L4T kernel: $vmlinuz"
+    elif [ -f "$MOUNT_POINT/boot/uImage" ]; then
+        $SUDO_PREFIX cp "$MOUNT_POINT/boot/uImage" "$BOOTFILES_DIR/Image"
+        log_success "Found kernel: uImage"
     elif [ -f "$MOUNT_POINT/boot/Image" ]; then
         $SUDO_PREFIX cp "$MOUNT_POINT/boot/Image" "$BOOTFILES_DIR/"
         log_success "Found kernel: Image"
@@ -724,14 +730,16 @@ stage_bootfiles() {
         NEED_SWITCHROOT_KERNEL=true
     fi
 
-    # Copy device tree (prefer nx-plat.dtimg from L4T debs)
+    # Copy device tree (prefer switch-bsp bootstack, then L4T debs)
     NEED_SWITCHROOT_DTB=false
-    if $SUDO_PREFIX ls "$MOUNT_POINT/boot/"*nx-plat*.dtimg 2>/dev/null | head -1; then
+    if [ -f "$MOUNT_POINT/opt/switchroot/bootstack/nx-plat.dtimg" ]; then
+        $SUDO_PREFIX cp "$MOUNT_POINT/opt/switchroot/bootstack/nx-plat.dtimg" "$BOOTFILES_DIR/"
+        log_success "Found switch-bsp DTB: nx-plat.dtimg"
+    elif $SUDO_PREFIX ls "$MOUNT_POINT/boot/"*nx-plat*.dtimg 2>/dev/null | head -1; then
         local dtimg=$($SUDO_PREFIX ls "$MOUNT_POINT/boot/"*nx-plat*.dtimg 2>/dev/null | head -1)
         $SUDO_PREFIX cp "$dtimg" "$BOOTFILES_DIR/nx-plat.dtimg"
         log_success "Found L4T DTB image: $dtimg"
     elif [ -d "$MOUNT_POINT/boot/dtb-l4t" ]; then
-        # L4T debs may install to dtb-l4t directory
         if $SUDO_PREFIX ls "$MOUNT_POINT/boot/dtb-l4t/"*nx-plat*.dtimg 2>/dev/null | head -1; then
             local dtimg=$($SUDO_PREFIX ls "$MOUNT_POINT/boot/dtb-l4t/"*nx-plat*.dtimg 2>/dev/null | head -1)
             $SUDO_PREFIX cp "$dtimg" "$BOOTFILES_DIR/nx-plat.dtimg"
@@ -751,6 +759,20 @@ stage_bootfiles() {
     else
         log_warn "No device tree found in image"
         NEED_SWITCHROOT_DTB=true
+    fi
+
+    # Copy additional bootstack files from switch-bsp
+    if [ -d "$MOUNT_POINT/opt/switchroot/bootstack" ]; then
+        for f in bl31.bin bl33.bin boot.scr initramfs bootlogo_ubuntu.bmp; do
+            if [ -f "$MOUNT_POINT/opt/switchroot/bootstack/$f" ]; then
+                $SUDO_PREFIX cp "$MOUNT_POINT/opt/switchroot/bootstack/$f" "$BOOTFILES_DIR/"
+                log_success "Copied bootstack: $f"
+            fi
+        done
+    fi
+    if [ -f "$MOUNT_POINT/opt/switchroot/bootloader.bin" ]; then
+        $SUDO_PREFIX cp "$MOUNT_POINT/opt/switchroot/bootloader.bin" "$BOOTFILES_DIR/"
+        log_success "Copied bootloader.bin"
     fi
 
     # Cleanup mount

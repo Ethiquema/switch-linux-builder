@@ -49,25 +49,31 @@ apt install $APT_OPTS \
     e2fsprogs \
     dosfstools \
     zstd \
-    zram-tools \
-    switch-bsp
+    zram-tools
 
-# NVIDIA L4T packages: preinst scripts check /proc/device-tree/compatible
-# which doesn't exist in QEMU. Download debs, strip preinst, install with dpkg.
-NVIDIA_PKGS=(
-    nvidia-l4t-core
-    nvidia-l4t-firmware
-    nvidia-l4t-3d-core
-    nvidia-l4t-x11
-    nvidia-l4t-wayland
-    nvidia-l4t-multimedia
+# NVIDIA L4T + switch-bsp: preinst scripts check /proc/device-tree/compatible
+# which doesn't exist in QEMU. Download all L4T debs with dependencies,
+# strip preinst scripts, then install with dpkg.
+mkdir -p /tmp/l4t-debs
+chmod 777 /tmp/l4t-debs
+cd /tmp/l4t-debs
+
+# Download switch-bsp and nvidia packages (vulkan ICD is in nvidia-l4t-3d-core)
+apt download \
+    switch-bsp \
+    nvidia-l4t-core \
+    nvidia-l4t-init \
+    nvidia-l4t-firmware \
+    nvidia-l4t-3d-core \
+    nvidia-l4t-cuda \
+    nvidia-l4t-x11 \
+    nvidia-l4t-wayland \
+    nvidia-l4t-multimedia \
+    nvidia-l4t-multimedia-utils \
+    nvidia-l4t-oem-config \
     nvidia-l4t-configs
-)
-mkdir -p /tmp/nvidia-debs
-cd /tmp/nvidia-debs
-apt download "${NVIDIA_PKGS[@]}"
 
-# Remove preinst scripts that check device-tree
+# Strip preinst scripts (device-tree check not possible in QEMU)
 for deb in *.deb; do
     mkdir -p fix
     dpkg-deb -R "$deb" fix/
@@ -76,10 +82,29 @@ for deb in *.deb; do
     rm -rf fix
 done
 
-dpkg -i --force-depends *.deb
-apt install -f $APT_OPTS
+# Install (unpack only, don't configure yet)
+dpkg --unpack --force-depends --force-overwrite *.deb || true
+
+# Create image_prep flag AFTER unpack so it doesn't get overwritten
+# switch-bsp postinst checks this file to skip boot disk mount
+mkdir -p /opt/switchroot
+touch /opt/switchroot/image_prep
+
+# Create apport blacklist dir (switch-bsp postinst writes to it)
+mkdir -p /etc/apport/blacklist.d
+
+# Now configure all packages (postinst will see image_prep and skip mount)
+dpkg --configure -a --force-depends || true
+apt install -f $APT_OPTS || true
 cd /
-rm -rf /tmp/nvidia-debs
+rm -rf /tmp/l4t-debs
+
+# Copy boot files from switch-bsp to /boot for image extraction (stage 6)
+if [[ -d /opt/switchroot/bootstack ]]; then
+    cp -a /opt/switchroot/bootstack/* /boot/ 2>/dev/null || true
+    cp /opt/switchroot/modules.tar.gz /boot/ 2>/dev/null || true
+    cp /opt/switchroot/bootloader.bin /boot/ 2>/dev/null || true
+fi
 
 # Stop zram during build (no module in QEMU)
 systemctl stop zramswap 2>/dev/null || true
@@ -149,6 +174,7 @@ systemctl enable ssh
 
 echo "=== Configuring Wayland environment ==="
 
+mkdir -p /etc/environment.d
 # System-wide environment for Wayland/Qt/SDL
 cat > /etc/environment.d/50-wayland.conf << 'EOF'
 # Wayland session
