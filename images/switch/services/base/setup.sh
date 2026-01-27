@@ -50,7 +50,11 @@ apt install $APT_OPTS \
     dosfstools \
     zstd \
     zram-tools \
-    switch-bsp \
+    switch-bsp
+
+# NVIDIA L4T packages: preinst scripts check /proc/device-tree/compatible
+# which doesn't exist in QEMU, so we force install and skip those checks
+apt install $APT_OPTS -o Dpkg::Options::="--force-all" \
     nvidia-l4t-core \
     nvidia-l4t-firmware \
     nvidia-l4t-3d-core \
