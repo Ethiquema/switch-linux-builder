@@ -50,14 +50,12 @@ apt install $APT_OPTS \
     dosfstools \
     zstd \
     zram-tools \
-    linux-image-l4t-switch \
-    linux-dtb-l4t-switch \
+    switch-bsp \
     nvidia-l4t-core \
     nvidia-l4t-firmware \
     nvidia-l4t-3d-core \
     nvidia-l4t-x11 \
     nvidia-l4t-wayland \
-    nvidia-l4t-libvulkan \
     nvidia-l4t-multimedia \
     nvidia-l4t-configs
 
