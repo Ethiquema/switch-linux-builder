@@ -53,32 +53,33 @@ apt install $APT_OPTS \
     switch-bsp
 
 # NVIDIA L4T packages: preinst scripts check /proc/device-tree/compatible
-# which doesn't exist in QEMU, fake it for installation
-if [[ ! -f /proc/device-tree/compatible ]]; then
-    mkdir -p /tmp/fake-dt
-    echo -n "nvidia,tegra210" > /tmp/fake-dt/compatible
-    mount --bind /tmp/fake-dt /proc/device-tree 2>/dev/null || {
-        # If bind mount fails, divert the preinst scripts instead
-        mkdir -p /proc/device-tree
-        echo -n "nvidia,tegra210" > /proc/device-tree/compatible
-    }
-    FAKE_DT=1
-fi
-
-apt install $APT_OPTS \
-    nvidia-l4t-core \
-    nvidia-l4t-firmware \
-    nvidia-l4t-3d-core \
-    nvidia-l4t-x11 \
-    nvidia-l4t-wayland \
-    nvidia-l4t-multimedia \
+# which doesn't exist in QEMU. Download debs, strip preinst, install with dpkg.
+NVIDIA_PKGS=(
+    nvidia-l4t-core
+    nvidia-l4t-firmware
+    nvidia-l4t-3d-core
+    nvidia-l4t-x11
+    nvidia-l4t-wayland
+    nvidia-l4t-multimedia
     nvidia-l4t-configs
+)
+mkdir -p /tmp/nvidia-debs
+cd /tmp/nvidia-debs
+apt download "${NVIDIA_PKGS[@]}"
 
-# Cleanup fake device-tree
-if [[ "${FAKE_DT:-}" == "1" ]]; then
-    umount /proc/device-tree 2>/dev/null || true
-    rm -rf /tmp/fake-dt
-fi
+# Remove preinst scripts that check device-tree
+for deb in *.deb; do
+    mkdir -p fix
+    dpkg-deb -R "$deb" fix/
+    rm -f fix/DEBIAN/preinst
+    dpkg-deb -b fix/ "$deb"
+    rm -rf fix
+done
+
+dpkg -i --force-depends *.deb
+apt install -f $APT_OPTS
+cd /
+rm -rf /tmp/nvidia-debs
 
 # Stop zram during build (no module in QEMU)
 systemctl stop zramswap 2>/dev/null || true
